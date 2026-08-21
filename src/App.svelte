@@ -5,19 +5,20 @@
   type View = 'home' | 'project' | 'queue' | 'outputs' | 'settings';
   type EditorTab = 'assembly' | 'cuts' | 'scripts';
   type SlotStatus = 'empty' | 'analyzing' | 'ready' | 'error';
-  type Slot = { key: string; label: string; description: string; file?: string; fileObject?: File; path?: string; sourceUrl?: string; cuts: LocalCut[]; duration: number; transcript?: string; headline?: string; status: SlotStatus };
+  type TranscriptStatus = 'idle' | 'loading' | 'ready' | 'error';
+  type Slot = { key: string; label: string; description: string; file?: string; fileObject?: File; path?: string; sourceUrl?: string; cuts: LocalCut[]; duration: number; transcript?: string; headline?: string; status: SlotStatus; transcriptStatus: TranscriptStatus };
   type Job = { id: string; name: string; status: 'queued' | 'processing' | 'done' | 'failed' | 'cancelled'; progress: number; current?: string; started: number; error?: string };
   type Output = { id: string; name: string; path?: string; blob?: Blob; created: number; combination: string };
   type DeviceProfile = { memoryGb: number; cores: number; tier: 'light' | 'standard' | 'power'; whisper: WhisperTier; nativeApp: boolean; isolated: boolean };
 
   const createSlots = (): Slot[] => [
-    { key: 'H1', label: 'Hooks', description: 'começa a conversa', cuts: [], duration: 0, status: 'empty' },
-    { key: 'H2', label: 'Hooks', description: 'segunda abertura', cuts: [], duration: 0, status: 'empty' },
-    { key: 'H3', label: 'Hooks', description: 'terceira abertura', cuts: [], duration: 0, status: 'empty' },
-    { key: 'C1', label: 'Corpos', description: 'desenvolve a ideia', cuts: [], duration: 0, status: 'empty' },
-    { key: 'C2', label: 'Corpos', description: 'segunda versão', cuts: [], duration: 0, status: 'empty' },
-    { key: 'CTA1', label: 'CTAs', description: 'fecha o vídeo', cuts: [], duration: 0, status: 'empty' },
-    { key: 'CTA2', label: 'CTAs', description: 'segunda finalização', cuts: [], duration: 0, status: 'empty' }
+    { key: 'H1', label: 'Hooks', description: 'começa a conversa', cuts: [], duration: 0, status: 'empty', transcriptStatus: 'idle' },
+    { key: 'H2', label: 'Hooks', description: 'segunda abertura', cuts: [], duration: 0, status: 'empty', transcriptStatus: 'idle' },
+    { key: 'H3', label: 'Hooks', description: 'terceira abertura', cuts: [], duration: 0, status: 'empty', transcriptStatus: 'idle' },
+    { key: 'C1', label: 'Corpos', description: 'desenvolve a ideia', cuts: [], duration: 0, status: 'empty', transcriptStatus: 'idle' },
+    { key: 'C2', label: 'Corpos', description: 'segunda versão', cuts: [], duration: 0, status: 'empty', transcriptStatus: 'idle' },
+    { key: 'CTA1', label: 'CTAs', description: 'fecha o vídeo', cuts: [], duration: 0, status: 'empty', transcriptStatus: 'idle' },
+    { key: 'CTA2', label: 'CTAs', description: 'segunda finalização', cuts: [], duration: 0, status: 'empty', transcriptStatus: 'idle' }
   ];
 
   let view: View = 'home';
@@ -33,8 +34,13 @@
   let outputs: Output[] = [];
   let rendering = false;
   let activeAbort: AbortController | undefined;
-  let autoTranscribe = true;
+  let autoTranscribe = false;
   let transcriptBusy = false;
+  let transcriptionAbort: AbortController | undefined;
+  let transcriptionTask: Promise<void> | undefined;
+  let transcriptionTimer: number | undefined;
+  let importingBatch = false;
+  const pendingTranscriptions = new Map<string, File>();
   let headlineBusy = false;
   let deepseekKey = '';
   let deepseekConsent = false;
@@ -58,7 +64,7 @@
     device = { memoryGb, cores, nativeApp: nativeApp || mobileBrowser, isolated: localTranscriptionAvailable(), tier: memoryGb >= 8 && cores >= 6 ? 'power' : memoryGb >= 6 && cores >= 4 ? 'standard' : 'light', whisper: memoryGb >= 8 && cores >= 6 ? 'small' : 'tiny' };
     deepseekKey = localStorage.getItem('cutline.deepseek.key') ?? '';
     deepseekConsent = localStorage.getItem('cutline.deepseek.consent') === 'true';
-    autoTranscribe = localStorage.getItem('cutline.transcription.auto') !== 'false';
+    autoTranscribe = localStorage.getItem('cutline.transcription.auto') === 'true';
     const source = new EventSource('/api/events');
     source.addEventListener('jobs', (event) => { try { const serverJobs = JSON.parse((event as MessageEvent).data) as Job[]; if (serverJobs.length) jobs = jobs.map((job) => serverJobs.find((serverJob) => serverJob.id === job.id) ?? job); } catch {} });
     return () => source.close();
@@ -82,18 +88,49 @@
     return message || 'Falha ao analisar este vídeo.';
   }
 
+  function scheduleTranscription(key: string, file: File) {
+    pendingTranscriptions.set(key, file);
+    if (transcriptionTimer !== undefined) window.clearTimeout(transcriptionTimer);
+    const flush = () => {
+      if (importingBatch) {
+        transcriptionTimer = window.setTimeout(flush, 700);
+        return;
+      }
+      transcriptionTimer = undefined;
+      const batch = [...pendingTranscriptions.entries()];
+      pendingTranscriptions.clear();
+      const run = async () => {
+        for (const [slotKey, slotFile] of batch) {
+          if (rendering) break;
+          await transcribeSlot(slotKey, slotFile);
+        }
+      };
+      transcriptionTask = (transcriptionTask ?? Promise.resolve()).then(run).catch(() => undefined);
+    };
+    transcriptionTimer = window.setTimeout(flush, 1400);
+  }
+
+  async function stopTranscriptionForRender() {
+    if (transcriptionTimer !== undefined) window.clearTimeout(transcriptionTimer);
+    transcriptionTimer = undefined;
+    pendingTranscriptions.clear();
+    transcriptionAbort?.abort();
+    await transcriptionTask?.catch(() => undefined);
+    transcriptionTask = undefined;
+  }
+
   async function addFileForSlot(index: number, file: File) {
     if (!file) return;
     const slot = slots[index];
     if (slot.sourceUrl) URL.revokeObjectURL(slot.sourceUrl);
     selectedSlotKey = slot.key;
-    updateSlot(slot.key, { file: file.name, fileObject: file, sourceUrl: URL.createObjectURL(file), status: 'analyzing', cuts: [], transcript: undefined, headline: undefined });
+    updateSlot(slot.key, { file: file.name, fileObject: file, sourceUrl: URL.createObjectURL(file), status: 'analyzing', cuts: [], transcript: undefined, headline: undefined, transcriptStatus: 'idle' });
     notify(`${file.name}: preparando o editor`);
     try {
       if (localProcessing) {
         const analysis = smartCut ? await analyzeLocal(file, intensity, (progress) => notify(`${file.name}: Smart Cut ${Math.round(progress * 100)}%`)) : { cuts: [], duration: 0 };
-        updateSlot(slot.key, { cuts: analysis.cuts, status: 'ready', duration: analysis.duration });
-        if (autoTranscribe && transcriptionReady) await transcribeSlot(slot.key, file);
+        updateSlot(slot.key, { cuts: analysis.cuts, status: 'ready', duration: analysis.duration, transcriptStatus: 'idle' });
+        if (autoTranscribe && transcriptionReady) scheduleTranscription(slot.key, file);
       } else {
         const form = new FormData(); form.append('file', file);
         const upload = await fetch('/api/assets', { method: 'POST', body: form });
@@ -106,7 +143,7 @@
           if (!analysis.ok) throw new Error((await analysis.json()).error ?? 'Smart Cut indisponível.');
           const result = await analysis.json(); cuts = result.cuts ?? []; duration = result.duration ?? 0;
         }
-        updateSlot(slot.key, { path: asset.path, cuts, duration, status: 'ready' });
+        updateSlot(slot.key, { path: asset.path, cuts, duration, status: 'ready', transcriptStatus: 'idle' });
       }
       notify(`${slot.key} pronto${smartCut ? ` · ${slots.find((item) => item.key === slot.key)?.cuts.length ?? 0} pausas tratadas` : ''}`);
     } catch (error) {
@@ -131,8 +168,13 @@
     const emptySlots = roleSlots.filter((slot) => !slot.file);
     const targets = emptySlots.length ? emptySlots : roleSlots;
     const selected = files.slice(0, targets.length);
-    for (let index = 0; index < selected.length; index += 1) {
-      await addFileForSlot(slots.indexOf(targets[index]), selected[index]);
+    importingBatch = true;
+    try {
+      for (let index = 0; index < selected.length; index += 1) {
+        await addFileForSlot(slots.indexOf(targets[index]), selected[index]);
+      }
+    } finally {
+      importingBatch = false;
     }
     if (files.length > selected.length) {
       notify(`${role}: só cabem ${targets.length} vídeos. Os primeiros foram colocados na ordem selecionada.`);
@@ -140,12 +182,20 @@
   }
 
   async function transcribeSlot(key: string, file: File) {
+    const controller = new AbortController();
+    transcriptionAbort = controller;
     transcriptBusy = true;
-    updateSlot(key, { status: 'analyzing' });
+    updateSlot(key, { transcriptStatus: 'loading' });
     try {
-      const transcript = await transcribeLocal(file, device.whisper, (progress) => notify(`${key}: transcrição local ${Math.round(progress * 100)}%`));
-      updateSlot(key, { transcript, status: 'ready' });
+      const transcript = await transcribeLocal(file, device.whisper, (progress) => notify(`${key}: transcrição local ${Math.round(progress * 100)}%`), controller.signal);
+      updateSlot(key, { transcript, transcriptStatus: 'ready' });
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        updateSlot(key, { transcriptStatus: 'error' });
+        notify(`${key}: vídeo pronto; transcrição ficou para depois.`);
+      }
     } finally {
+      if (transcriptionAbort === controller) transcriptionAbort = undefined;
       transcriptBusy = false;
     }
   }
@@ -156,6 +206,7 @@
     if (!combinations) return notify('Adicione pelo menos um Hook, um Corpo e um CTA.');
     if (rendering) return;
     rendering = true;
+    await stopTranscriptionForRender();
     activeAbort = new AbortController();
     const job: Job = { id: crypto.randomUUID(), name: `${activeProject} · ${combinations} combinações`, status: 'queued', progress: 0, started: Date.now() };
     jobs = [job, ...jobs]; view = 'queue';
@@ -255,7 +306,7 @@
         <div class="project-heading"><div><p class="date-line">projeto local <span class="saved-dot"></span></p><h1>Vamos montar seu vídeo <i class="ph ph-sparkle still"></i></h1><p>Coloque Hook, Corpo e CTA. O editor faz o resto.</p></div><button class="render-button" disabled={!combinations || rendering} on:click={render}>{rendering ? 'Processando' : 'Renderizar'} <i class="ph ph-arrow-up-right"></i></button></div>
         <div class="editor-tabs" role="tablist"><button class:active={editorTab === 'assembly'} on:click={() => editorTab = 'assembly'}><i class="ph ph-squares-four"></i>Montagem</button><button class:active={editorTab === 'cuts'} on:click={() => editorTab = 'cuts'}><i class="ph ph-waveform"></i>Smart Cut{#if slots.some((slot) => slot.cuts.length)}<b>{slots.reduce((total, slot) => total + slot.cuts.length, 0)}</b>{/if}</button><button class:active={editorTab === 'scripts'} on:click={() => editorTab = 'scripts'}><i class="ph ph-text-aa"></i>Roteiros{#if transcribedSlots.length}<b>{transcribedSlots.length}</b>{/if}</button></div>
         {#if editorTab === 'assembly'}
-          <div class="role-grid">{#each ['Hooks', 'Corpos', 'CTAs'] as role, roleIndex}<section class="role-drop"><div class="role-icon"><i class={`ph ${roleIndex === 0 ? 'ph-anchor' : roleIndex === 1 ? 'ph-play-circle' : 'ph-flag'}`}></i></div><h2>{role}</h2><p>{roleIndex === 0 ? 'O começo que chama atenção' : roleIndex === 1 ? 'A parte que conta a história' : 'O final que convida a agir'}</p><label class="role-import-button"><input type="file" multiple accept="video/*,.mp4,.mov,.m4v" on:change={(event) => addFilesToRole(role, event)} /><i class="ph ph-upload-simple"></i><span>Selecionar {role === 'Hooks' ? 'até 3 vídeos' : 'vários vídeos'}</span></label><div class="role-slots">{#each slots.filter((slot) => slot.label === role) as slot}<label class:file-added={slot.file} class:slot-error={slot.status === 'error'} class="role-slot"><input type="file" accept="video/*,.mp4,.mov,.m4v" on:change={(event) => addFile(slots.indexOf(slot), event)} /><span>{slot.key}</span>{#if slot.file}<strong>{slot.file}</strong><small>{slot.status === 'analyzing' ? 'analisando...' : slot.transcript ? 'transcrito e pronto' : 'vídeo importado'}</small><i class={`ph ${slot.status === 'analyzing' ? 'ph-spinner-gap' : slot.status === 'error' ? 'ph-warning' : 'ph-check'}`}></i>{:else}<strong>Adicionar vídeo</strong><small>{slot.description}</small><b><i class="ph ph-plus"></i></b>{/if}</label>{/each}</div></section>{/each}</div>
+          <div class="role-grid">{#each ['Hooks', 'Corpos', 'CTAs'] as role, roleIndex}<section class="role-drop"><div class="role-icon"><i class={`ph ${roleIndex === 0 ? 'ph-anchor' : roleIndex === 1 ? 'ph-play-circle' : 'ph-flag'}`}></i></div><h2>{role}</h2><p>{roleIndex === 0 ? 'O começo que chama atenção' : roleIndex === 1 ? 'A parte que conta a história' : 'O final que convida a agir'}</p><label class="role-import-button"><input type="file" multiple accept="video/*,.mp4,.mov,.m4v" on:change={(event) => addFilesToRole(role, event)} /><i class="ph ph-upload-simple"></i><span>Selecionar {role === 'Hooks' ? 'até 3 vídeos' : 'vários vídeos'}</span></label><div class="role-slots">{#each slots.filter((slot) => slot.label === role) as slot}<label class:file-added={slot.file} class:slot-error={slot.status === 'error'} class="role-slot"><input type="file" accept="video/*,.mp4,.mov,.m4v" on:change={(event) => addFile(slots.indexOf(slot), event)} /><span>{slot.key}</span>{#if slot.file}<strong>{slot.file}</strong><small>{slot.status === 'analyzing' ? 'Smart Cut analisando...' : slot.transcriptStatus === 'loading' ? 'Whisper em segundo plano...' : slot.transcript ? 'transcrito e pronto' : 'vídeo importado'}</small><i class={`ph ${slot.status === 'analyzing' || slot.transcriptStatus === 'loading' ? 'ph-spinner-gap' : slot.status === 'error' || slot.transcriptStatus === 'error' ? 'ph-warning' : 'ph-check'}`}></i>{:else}<strong>Adicionar vídeo</strong><small>{slot.description}</small><b><i class="ph ph-plus"></i></b>{/if}</label>{/each}</div></section>{/each}</div>
           <div class="editor-lower"><section class="preview-panel"><div class="panel-title"><span>Prévia do módulo</span><small>{selectedSlot?.key ?? '—'}</small></div>{#if selectedSlot?.sourceUrl}<video class="video-preview" controls preload="metadata" src={selectedSlot.sourceUrl} on:error={() => notify('A prévia não conseguiu abrir este arquivo. Tente um MP4 ou MOV salvo localmente.')}><track kind="captions" srclang="pt-BR" label="Português" src="data:text/vtt,WEBVTT" /></video>{:else}<div class="preview-empty"><i class="ph ph-play-circle"></i><span>Selecione um vídeo para visualizar</span></div>{/if}<div class="slot-picker">{#each slots as slot}<button class:active={selectedSlotKey === slot.key} disabled={!slot.file} on:click={() => selectedSlotKey = slot.key}>{slot.key}</button>{/each}</div></section><section class="smart-panel"><div class="panel-title"><span>Smart Cut</span><button class="smart-cut-button" class:on={smartCut} on:click={() => smartCut = !smartCut}>{smartCut ? 'Ligado' : 'Desligado'} <span></span></button></div><p>Comprime pausas longas, mantém respiro e evita cortes nervosos.</p><div class="intensity-row"><span>Intensidade</span>{#each [['natural', 'Natural'], ['dynamic', 'Dynamic'], ['aggressive', 'Aggressive']] as option}<button class:active={intensity === option[0]} on:click={() => intensity = option[0]}>{option[1]}</button>{/each}</div><button class="smart-details" on:click={() => editorTab = 'cuts'}>Ver cortes encontrados <i class="ph ph-arrow-right"></i></button></section></div>
         {:else if editorTab === 'cuts'}
           <section class="cuts-workspace"><div class="cut-selector"><span>Escolha um módulo</span><div>{#each slots.filter((slot) => slot.file) as slot}<button class:active={selectedSlotKey === slot.key} on:click={() => selectedSlotKey = slot.key}>{slot.key}</button>{/each}</div></div>{#if selectedSlot?.file}<div class="timeline-card"><div class="panel-title"><div><strong>{selectedSlot.key} · {selectedSlot.file}</strong><small>{selectedSlot.cuts.length} pausas longas encontradas · clique para ativar ou ignorar</small></div><button class="smart-cut-button" class:on={smartCut} on:click={() => smartCut = !smartCut}>{smartCut ? 'Smart Cut ligado' : 'Smart Cut desligado'} <span></span></button></div><div class="timeline"><div class="timeline-speech"></div>{#each selectedSlot.cuts as cut, cutIndex}<button class:disabled={!cut.enabled} class="cut-marker" style={`left:${Math.min(94, (cut.start / Math.max(selectedSlot.duration, cut.end + 1)) * 100)}%;width:${Math.max(2, ((cut.end - cut.start) / Math.max(selectedSlot.duration, cut.end + 1)) * 100)}%`} title={`${cut.start.toFixed(1)}s – ${cut.end.toFixed(1)}s`} on:click={() => toggleCut(selectedSlot.key, cutIndex)}><span>{cut.enabled ? 'comprimir' : 'manter'}</span></button>{/each}</div><div class="timeline-legend"><span><i class="speech-dot"></i>fala preservada</span><span><i class="cut-dot"></i>pausa tratada</span><span>{selectedSlot.duration ? `${selectedSlot.duration.toFixed(1)}s analisados` : 'análise leve de áudio'}</span></div></div>{:else}<div class="empty-projects"><div class="empty-icon"><i class="ph ph-waveform"></i></div><h2>Importe um módulo</h2><p>Os cortes aparecem aqui antes de renderizar.</p><button class="empty-action" on:click={() => editorTab = 'assembly'}>Voltar à montagem</button></div>{/if}</section>

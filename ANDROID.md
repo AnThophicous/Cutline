@@ -2,7 +2,7 @@
 
 O APK usa Capacitor e leva o frontend para dentro do celular. O processamento local usa `@ffmpeg/ffmpeg` + `@ffmpeg/core` (FFmpeg compilado para WebAssembly). Smart Cut e concatenação rodam no aparelho; o servidor LAN é usado como fallback no desktop.
 
-O core FFmpeg fica no bundle do app. O Whisper.cpp fica em um chunk separado, com o worker local servido junto do app, e o modelo quantizado é baixado uma vez, com cache local, somente quando a transcrição é ativada e o WebView oferece memória compartilhada. Em aparelhos com 8 GB ou mais e CPU adequada, o perfil sugere `small-q5_1`; nos demais, `tiny-q5_1`.
+O core FFmpeg fica no bundle do app. O Whisper.cpp fica em um chunk separado, com o worker e os modelos quantizados `tiny-q5_1` e `small-q5_1` embutidos no APK release. Em aparelhos com 8 GB ou mais e CPU adequada, o perfil sugere `small-q5_1`; nos demais, `tiny-q5_1`. O APK fica aproximadamente 220 MB maior por causa dos modelos, mas não há download de modelo no primeiro uso.
 
 O workflow `.github/workflows/android.yml` gera os ícones nativos a partir de `resources/icon.png`, compila um APK `release` e o assina no GitHub Actions com Node 22, Java 21 e Android SDK. Para que novas versões atualizem a instalação anterior, configure uma keystore persistente nos secrets `CUTLINE_KEYSTORE_B64`, `CUTLINE_STORE_PASSWORD`, `CUTLINE_KEY_ALIAS` e `CUTLINE_KEY_PASSWORD`; sem eles, o workflow usa uma chave temporária instalável.
 

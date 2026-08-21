@@ -16,6 +16,13 @@ jobs:
         with: { distribution: temurin, java-version: '21' }
       - uses: android-actions/setup-android@v3
       - run: npm ci
+      - name: Bundle quantized Whisper models
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public/models
+          curl --fail --location --retry 3 --retry-delay 2 --output public/models/ggml-tiny-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q5_1.bin
+          curl --fail --location --retry 3 --retry-delay 2 --output public/models/ggml-small-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
       - run: npm run build
       - run: npx cap add android
       - run: npx @capacitor/assets generate --android --iconBackgroundColor '#0c0b10' --iconBackgroundColorDark '#0c0b10'

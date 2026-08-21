@@ -12,6 +12,10 @@ const modelUrls: Record<WhisperTier, string> = {
   tiny: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q5_1.bin',
   small: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin'
 };
+const bundledModelUrls: Record<WhisperTier, string> = {
+  tiny: '/models/ggml-tiny-q5_1.bin',
+  small: '/models/ggml-small-q5_1.bin'
+};
 
 let ffmpeg: FFmpeg | undefined;
 let ffmpegLoad: Promise<FFmpeg> | undefined;
@@ -172,21 +176,40 @@ export async function concatLocal(blobs: Blob[], onProgress?: (value: number) =>
   }
 }
 
-async function cachedModel(url: string, onProgress?: (value: number) => void) {
-  if (typeof caches === 'undefined') return new Uint8Array(await (await fetch(url)).arrayBuffer());
+async function cachedModel(url: string, onProgress?: (value: number) => void, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  const tier = (Object.keys(modelUrls) as WhisperTier[]).find((key) => modelUrls[key] === url);
+  const bundledUrl = tier ? bundledModelUrls[tier] : undefined;
+  if (bundledUrl) {
+    const bundled = await fetch(bundledUrl, { signal }).catch((error) => {
+      if (signal?.aborted) throw error;
+      return undefined;
+    });
+    const contentType = bundled?.headers.get('content-type') ?? '';
+    const contentLength = Number(bundled?.headers.get('content-length')) || 0;
+    if (bundled?.ok && !contentType.includes('text/html') && (contentLength === 0 || contentLength > 1_000_000)) {
+      return readModelResponse(bundled, onProgress, signal);
+    }
+  }
+  if (typeof caches === 'undefined') return new Uint8Array(await (await fetch(url, { signal })).arrayBuffer());
   const cache = await caches.open('cutline-whisper-models-v1');
   let response = await cache.match(url);
   if (!response) {
-    response = await fetch(url);
+    response = await fetch(url, { signal });
     if (!response.ok) throw new Error('Não foi possível baixar o modelo de transcrição.');
     await cache.put(url, response.clone());
   }
+  return readModelResponse(response, onProgress, signal);
+}
+
+async function readModelResponse(response: Response, onProgress?: (value: number) => void, signal?: AbortSignal) {
   const total = Number(response.headers.get('content-length')) || 1;
   const reader = response.body?.getReader();
   if (!reader) return new Uint8Array(await response.arrayBuffer());
   const parts: Uint8Array[] = [];
   let loaded = 0;
   while (true) {
+    signal?.throwIfAborted();
     const chunk = await reader.read();
     if (chunk.done) break;
     parts.push(chunk.value);
@@ -203,22 +226,26 @@ export function localTranscriptionAvailable() {
   return typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined';
 }
 
-export async function transcribeLocal(file: File, tier: WhisperTier, onProgress?: (value: number) => void) {
+export async function transcribeLocal(file: File, tier: WhisperTier, onProgress?: (value: number) => void, signal?: AbortSignal) {
   if (!localTranscriptionAvailable()) throw new Error('Este aparelho não liberou memória compartilhada para a transcrição local.');
+  signal?.throwIfAborted();
   const engine = await getFFmpeg();
   const input = filename(file);
   const audio = `cutline-audio-${crypto.randomUUID()}.f32`;
   try {
     await engine.writeFile(input, await fileBytes(file));
+    signal?.throwIfAborted();
     onProgress?.(0.04);
     const code = await engine.exec(['-i', input, '-vn', '-ac', '1', '-ar', '16000', '-f', 'f32le', audio]);
     if (code !== 0) throw new Error('Não foi possível preparar o áudio para transcrição.');
     const pcmBytes = asBytes(await engine.readFile(audio));
+    signal?.throwIfAborted();
     const pcm = new Float32Array(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength));
     onProgress?.(0.2);
     const whisperModule = await import('whisper.cpp');
     const factory = whisperModule.default ?? whisperModule;
-    const model = await cachedModel(modelUrls[tier], (value) => onProgress?.(0.2 + value * 0.45));
+    const model = await cachedModel(modelUrls[tier], (value) => onProgress?.(0.2 + value * 0.45), signal);
+    signal?.throwIfAborted();
     const modelPath = `cutline-${tier}.bin`;
     const lines: string[] = [];
     const instance = await factory({
