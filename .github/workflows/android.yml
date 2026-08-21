@@ -18,6 +18,7 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npx cap add android
+      - run: npx @capacitor/assets generate --android --iconBackgroundColor '#0c0b10' --iconBackgroundColorDark '#0c0b10'
       - run: npx cap sync android
       - run: cd android && ./gradlew assembleRelease --no-daemon
       - name: Sign and verify release APK

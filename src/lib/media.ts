@@ -1,7 +1,7 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile } from '@ffmpeg/util';
 import coreURL from '@ffmpeg/core?url';
 import wasmURL from '@ffmpeg/core/wasm?url';
+import whisperScriptURL from 'whisper.cpp/whisper.js?url';
 
 export type LocalCut = { start: number; end: number; enabled: boolean };
 export type WhisperTier = 'tiny' | 'small';
@@ -24,9 +24,29 @@ async function getFFmpeg() {
       await instance.load({ coreURL, wasmURL });
       ffmpeg = instance;
       return instance;
-    })();
+    })().catch((error) => {
+      ffmpegLoad = undefined;
+      throw error;
+    });
   }
   return ffmpegLoad;
+}
+
+function resetFFmpeg() {
+  ffmpeg?.terminate();
+  ffmpeg = undefined;
+  ffmpegLoad = undefined;
+}
+
+async function fileBytes(file: Blob) {
+  // fetchFile() is convenient on desktop, but Android WebViews can hand it a
+  // File object whose internal path is not readable. Reading the selected
+  // file directly keeps the WASM filesystem completely disk/bytes based.
+  return new Uint8Array(await file.arrayBuffer());
+}
+
+async function deleteFile(engine: FFmpeg, name: string) {
+  await engine.deleteFile(name).catch(() => undefined);
 }
 
 function filename(file: File) {
@@ -53,84 +73,103 @@ function normalizeCuts(cuts: LocalCut[]) {
 export async function analyzeLocal(file: File, intensity: string, onProgress?: (value: number) => void) {
   const engine = await getFFmpeg();
   const input = filename(file);
-  await engine.writeFile(input, await fetchFile(file));
   const logs: string[] = [];
   const listener = ({ message }: { message: string }) => logs.push(message);
-  engine.on('log', listener);
-  onProgress?.(0.12);
-  await engine.exec(['-i', input, '-af', 'silencedetect=noise=-35dB:d=1', '-f', 'null', '-']);
-  engine.off('log', listener);
-  const padding = intensity === 'aggressive' ? 0.1 : intensity === 'dynamic' ? 0.18 : 0.28;
-  let open: number | undefined;
-  const cuts: LocalCut[] = [];
-  for (const line of logs.join('\n').split(/\r?\n/)) {
-    const start = line.match(silenceStart);
-    const end = line.match(silenceEnd);
-    if (start) open = Number(start[1]);
-    if (end && open !== undefined) {
-      const from = open + padding;
-      const to = Number(end[1]) - padding;
-      if (to - from >= 0.45) cuts.push({ start: Number(from.toFixed(3)), end: Number(to.toFixed(3)), enabled: true });
-      open = undefined;
+  try {
+    await engine.writeFile(input, await fileBytes(file));
+    engine.on('log', listener);
+    onProgress?.(0.12);
+    const code = await engine.exec(['-i', input, '-af', 'silencedetect=noise=-35dB:d=1', '-f', 'null', '-']);
+    if (code !== 0) throw new Error('O FFmpeg local não conseguiu ler este vídeo.');
+    const padding = intensity === 'aggressive' ? 0.1 : intensity === 'dynamic' ? 0.18 : 0.28;
+    let open: number | undefined;
+    const cuts: LocalCut[] = [];
+    for (const line of logs.join('\n').split(/\r?\n/)) {
+      const start = line.match(silenceStart);
+      const end = line.match(silenceEnd);
+      if (start) open = Number(start[1]);
+      if (end && open !== undefined) {
+        const from = open + padding;
+        const to = Number(end[1]) - padding;
+        if (to - from >= 0.45) cuts.push({ start: Number(from.toFixed(3)), end: Number(to.toFixed(3)), enabled: true });
+        open = undefined;
+      }
     }
+    const duration = await probeDuration(engine, input);
+    onProgress?.(1);
+    return { cuts: normalizeCuts(cuts), duration };
+  } catch (error) {
+    resetFFmpeg();
+    throw error;
+  } finally {
+    engine.off('log', listener);
+    await deleteFile(engine, input);
   }
-  const duration = await probeDuration(engine, input);
-  await engine.deleteFile(input).catch(() => undefined);
-  onProgress?.(1);
-  return { cuts: normalizeCuts(cuts), duration };
 }
 
 export async function cutLocal(file: File, cuts: LocalCut[], onProgress?: (value: number) => void) {
   const engine = await getFFmpeg();
   const input = filename(file);
   const output = `cutline-output-${crypto.randomUUID()}.mp4`;
-  await engine.writeFile(input, await fetchFile(file));
-  const total = await probeDuration(engine, input);
-  const segments: Array<[number, number]> = [];
-  let cursor = 0;
-  for (const cut of cuts.filter((item) => item.enabled !== false)) {
-    if (cut.start > cursor) segments.push([cursor, cut.start]);
-    cursor = Math.max(cursor, cut.end);
-  }
-  if (cursor < total) segments.push([cursor, total]);
-  if (!segments.length) throw new Error('Nenhum trecho de fala foi preservado.');
-  const filters = segments.flatMap(([start, end], index) => [
-    `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${index}]`,
-    `[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${index}]`
-  ]);
-  const concatInputs = segments.map((_, index) => `[v${index}][a${index}]`).join('');
-  filters.push(`${concatInputs}concat=n=${segments.length}:v=1:a=1[outv][outa]`);
   const progress = ({ progress: value }: { progress: number }) => onProgress?.(Math.max(0.05, Math.min(0.98, value)));
-  engine.on('progress', progress);
-  const code = await engine.exec(['-i', input, '-filter_complex', filters.join(';'), '-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-c:a', 'aac', '-movflags', '+faststart', output]);
-  engine.off('progress', progress);
-  if (code !== 0) throw new Error('O FFmpeg local não conseguiu montar este vídeo.');
-  const data = asBytes(await engine.readFile(output));
-  await engine.deleteFile(input).catch(() => undefined);
-  await engine.deleteFile(output).catch(() => undefined);
-  onProgress?.(1);
-  const blobBytes = new Uint8Array(data.byteLength); blobBytes.set(data);
-  return new Blob([blobBytes.buffer], { type: 'video/mp4' });
+  try {
+    await engine.writeFile(input, await fileBytes(file));
+    const total = await probeDuration(engine, input);
+    const segments: Array<[number, number]> = [];
+    let cursor = 0;
+    for (const cut of cuts.filter((item) => item.enabled !== false)) {
+      if (cut.start > cursor) segments.push([cursor, cut.start]);
+      cursor = Math.max(cursor, cut.end);
+    }
+    if (cursor < total) segments.push([cursor, total]);
+    if (!segments.length) throw new Error('Nenhum trecho de fala foi preservado.');
+    const filters = segments.flatMap(([start, end], index) => [
+      `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${index}]`,
+      `[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${index}]`
+    ]);
+    const concatInputs = segments.map((_, index) => `[v${index}][a${index}]`).join('');
+    filters.push(`${concatInputs}concat=n=${segments.length}:v=1:a=1[outv][outa]`);
+    engine.on('progress', progress);
+    const code = await engine.exec(['-i', input, '-filter_complex', filters.join(';'), '-map', '[outv]', '-map', '[outa]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-c:a', 'aac', '-movflags', '+faststart', output]);
+    if (code !== 0) throw new Error('O FFmpeg local não conseguiu montar este vídeo.');
+    const data = asBytes(await engine.readFile(output));
+    onProgress?.(1);
+    const blobBytes = new Uint8Array(data.byteLength); blobBytes.set(data);
+    return new Blob([blobBytes.buffer], { type: 'video/mp4' });
+  } catch (error) {
+    resetFFmpeg();
+    throw error;
+  } finally {
+    engine.off('progress', progress);
+    await deleteFile(engine, input);
+    await deleteFile(engine, output);
+  }
 }
 
 export async function concatLocal(blobs: Blob[], onProgress?: (value: number) => void) {
   const engine = await getFFmpeg();
   const names = blobs.map((_, index) => `cutline-module-${index}-${crypto.randomUUID()}.mp4`);
   const output = `cutline-combination-${crypto.randomUUID()}.mp4`;
-  for (let index = 0; index < blobs.length; index += 1) await engine.writeFile(names[index], await fetchFile(blobs[index]));
   const list = `cutline-list-${crypto.randomUUID()}.txt`;
-  await engine.writeFile(list, names.map((name) => `file '${name}'`).join('\n'));
   const progress = ({ progress: value }: { progress: number }) => onProgress?.(Math.max(0.05, Math.min(0.98, value)));
-  engine.on('progress', progress);
-  let code = await engine.exec(['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', output]);
-  if (code !== 0) code = await engine.exec(['-f', 'concat', '-safe', '0', '-i', list, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-c:a', 'aac', '-movflags', '+faststart', output]);
-  engine.off('progress', progress);
-  if (code !== 0) throw new Error('Não foi possível juntar os módulos desta combinação.');
-  const data = asBytes(await engine.readFile(output));
-  for (const name of [...names, list, output]) await engine.deleteFile(name).catch(() => undefined);
-  onProgress?.(1);
-  const blobBytes = new Uint8Array(data.byteLength); blobBytes.set(data);
-  return new Blob([blobBytes.buffer], { type: 'video/mp4' });
+  try {
+    for (let index = 0; index < blobs.length; index += 1) await engine.writeFile(names[index], await fileBytes(blobs[index]));
+    await engine.writeFile(list, names.map((name) => `file '${name}'`).join('\n'));
+    engine.on('progress', progress);
+    let code = await engine.exec(['-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', output]);
+    if (code !== 0) code = await engine.exec(['-f', 'concat', '-safe', '0', '-i', list, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-c:a', 'aac', '-movflags', '+faststart', output]);
+    if (code !== 0) throw new Error('Não foi possível juntar os módulos desta combinação.');
+    const data = asBytes(await engine.readFile(output));
+    onProgress?.(1);
+    const blobBytes = new Uint8Array(data.byteLength); blobBytes.set(data);
+    return new Blob([blobBytes.buffer], { type: 'video/mp4' });
+  } catch (error) {
+    resetFFmpeg();
+    throw error;
+  } finally {
+    engine.off('progress', progress);
+    for (const name of [...names, list, output]) await deleteFile(engine, name);
+  }
 }
 
 async function cachedModel(url: string, onProgress?: (value: number) => void) {
@@ -169,27 +208,38 @@ export async function transcribeLocal(file: File, tier: WhisperTier, onProgress?
   const engine = await getFFmpeg();
   const input = filename(file);
   const audio = `cutline-audio-${crypto.randomUUID()}.f32`;
-  await engine.writeFile(input, await fetchFile(file));
-  onProgress?.(0.04);
-  const code = await engine.exec(['-i', input, '-vn', '-ac', '1', '-ar', '16000', '-f', 'f32le', audio]);
-  if (code !== 0) throw new Error('Não foi possível preparar o áudio para transcrição.');
-  const pcmBytes = asBytes(await engine.readFile(audio));
-  const pcm = new Float32Array(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength));
-  onProgress?.(0.2);
-  const whisperModule = await import('whisper.cpp');
-  const factory = whisperModule.default ?? whisperModule;
-  const model = await cachedModel(modelUrls[tier], (value) => onProgress?.(0.2 + value * 0.45));
-  const modelPath = `cutline-${tier}.bin`;
-  const lines: string[] = [];
-  const instance = await factory({ print: (line: string) => { if (/-->/.test(line)) lines.push(line.replace(/^.*?\]\s*/, '').trim()); }, printErr: () => undefined });
-  instance.FS_createDataFile('/', modelPath, model, true, true);
-  if (!instance.init(modelPath)) throw new Error('O modelo Whisper não pôde ser inicializado.');
-  instance.full_default(pcm, 'pt', false);
-  instance.free();
-  await engine.deleteFile(input).catch(() => undefined);
-  await engine.deleteFile(audio).catch(() => undefined);
-  onProgress?.(1);
-  return lines.join(' ').replace(/\s+/g, ' ').trim();
+  try {
+    await engine.writeFile(input, await fileBytes(file));
+    onProgress?.(0.04);
+    const code = await engine.exec(['-i', input, '-vn', '-ac', '1', '-ar', '16000', '-f', 'f32le', audio]);
+    if (code !== 0) throw new Error('Não foi possível preparar o áudio para transcrição.');
+    const pcmBytes = asBytes(await engine.readFile(audio));
+    const pcm = new Float32Array(pcmBytes.buffer.slice(pcmBytes.byteOffset, pcmBytes.byteOffset + pcmBytes.byteLength));
+    onProgress?.(0.2);
+    const whisperModule = await import('whisper.cpp');
+    const factory = whisperModule.default ?? whisperModule;
+    const model = await cachedModel(modelUrls[tier], (value) => onProgress?.(0.2 + value * 0.45));
+    const modelPath = `cutline-${tier}.bin`;
+    const lines: string[] = [];
+    const instance = await factory({
+      mainScriptUrlOrBlob: whisperScriptURL,
+      locateFile: (path: string) => path === 'libwhisper.worker.js' ? new URL('/libwhisper.worker.js', location.origin).toString() : path,
+      print: (line: string) => { if (/-->/.test(line)) lines.push(line.replace(/^.*?\]\s*/, '').trim()); },
+      printErr: () => undefined
+    });
+    instance.FS_createDataFile('/', modelPath, model, true, true);
+    if (!instance.init(modelPath)) throw new Error('O modelo Whisper não pôde ser inicializado.');
+    instance.full_default(pcm, 'pt', false);
+    instance.free();
+    onProgress?.(1);
+    return lines.join(' ').replace(/\s+/g, ' ').trim();
+  } catch (error) {
+    resetFFmpeg();
+    throw error;
+  } finally {
+    await deleteFile(engine, input);
+    await deleteFile(engine, audio);
+  }
 }
 
 export { modelUrls };

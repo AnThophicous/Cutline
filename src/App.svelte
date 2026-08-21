@@ -74,10 +74,18 @@
   function setConsent(value: boolean) { deepseekConsent = value; localStorage.setItem('cutline.deepseek.consent', String(value)); }
   function deviceSummary() { return localProcessing ? `local · ${device.memoryGb} GB · ${device.cores} núcleos` : `LAN · ${device.cores} núcleos detectados`; }
 
-  async function addFile(index: number, event: Event) {
-    const file = (event.currentTarget as HTMLInputElement).files?.[0];
+  function importError(error: unknown) {
+    const message = error instanceof Error ? error.message : '';
+    if (/file could not be read|code\s*=\s*-?1|não conseguiu ler este vídeo/i.test(message)) {
+      return 'O Android não conseguiu ler este vídeo. Tente importar novamente ou escolha um MP4/MOV salvo no aparelho.';
+    }
+    return message || 'Falha ao analisar este vídeo.';
+  }
+
+  async function addFileForSlot(index: number, file: File) {
     if (!file) return;
     const slot = slots[index];
+    if (slot.sourceUrl) URL.revokeObjectURL(slot.sourceUrl);
     selectedSlotKey = slot.key;
     updateSlot(slot.key, { file: file.name, fileObject: file, sourceUrl: URL.createObjectURL(file), status: 'analyzing', cuts: [], transcript: undefined, headline: undefined });
     notify(`${file.name}: preparando o editor`);
@@ -103,7 +111,31 @@
       notify(`${slot.key} pronto${smartCut ? ` · ${slots.find((item) => item.key === slot.key)?.cuts.length ?? 0} pausas tratadas` : ''}`);
     } catch (error) {
       updateSlot(slot.key, { status: 'error' });
-      notify(error instanceof Error ? error.message : 'Falha ao analisar este vídeo.');
+      notify(importError(error));
+    }
+  }
+
+  async function addFile(index: number, event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (file) await addFileForSlot(index, file);
+  }
+
+  async function addFilesToRole(role: string, event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const files = Array.from(input.files ?? []);
+    input.value = '';
+    if (!files.length) return;
+    const roleSlots = slots.filter((slot) => slot.label === role);
+    const emptySlots = roleSlots.filter((slot) => !slot.file);
+    const targets = emptySlots.length ? emptySlots : roleSlots;
+    const selected = files.slice(0, targets.length);
+    for (let index = 0; index < selected.length; index += 1) {
+      await addFileForSlot(slots.indexOf(targets[index]), selected[index]);
+    }
+    if (files.length > selected.length) {
+      notify(`${role}: só cabem ${targets.length} vídeos. Os primeiros foram colocados na ordem selecionada.`);
     }
   }
 
@@ -223,8 +255,8 @@
         <div class="project-heading"><div><p class="date-line">projeto local <span class="saved-dot"></span></p><h1>Vamos montar seu vídeo <i class="ph ph-sparkle still"></i></h1><p>Coloque Hook, Corpo e CTA. O editor faz o resto.</p></div><button class="render-button" disabled={!combinations || rendering} on:click={render}>{rendering ? 'Processando' : 'Renderizar'} <i class="ph ph-arrow-up-right"></i></button></div>
         <div class="editor-tabs" role="tablist"><button class:active={editorTab === 'assembly'} on:click={() => editorTab = 'assembly'}><i class="ph ph-squares-four"></i>Montagem</button><button class:active={editorTab === 'cuts'} on:click={() => editorTab = 'cuts'}><i class="ph ph-waveform"></i>Smart Cut{#if slots.some((slot) => slot.cuts.length)}<b>{slots.reduce((total, slot) => total + slot.cuts.length, 0)}</b>{/if}</button><button class:active={editorTab === 'scripts'} on:click={() => editorTab = 'scripts'}><i class="ph ph-text-aa"></i>Roteiros{#if transcribedSlots.length}<b>{transcribedSlots.length}</b>{/if}</button></div>
         {#if editorTab === 'assembly'}
-          <div class="role-grid">{#each ['Hooks', 'Corpos', 'CTAs'] as role, roleIndex}<section class="role-drop"><div class="role-icon"><i class={`ph ${roleIndex === 0 ? 'ph-anchor' : roleIndex === 1 ? 'ph-play-circle' : 'ph-flag'}`}></i></div><h2>{role}</h2><p>{roleIndex === 0 ? 'O começo que chama atenção' : roleIndex === 1 ? 'A parte que conta a história' : 'O final que convida a agir'}</p><div class="role-slots">{#each slots.filter((slot) => slot.label === role) as slot}<label class:file-added={slot.file} class:slot-error={slot.status === 'error'} class="role-slot"><input type="file" accept="video/*" on:change={(event) => addFile(slots.indexOf(slot), event)} /><span>{slot.key}</span>{#if slot.file}<strong>{slot.file}</strong><small>{slot.status === 'analyzing' ? 'analisando...' : slot.transcript ? 'transcrito e pronto' : 'vídeo importado'}</small><i class={`ph ${slot.status === 'analyzing' ? 'ph-spinner-gap' : slot.status === 'error' ? 'ph-warning' : 'ph-check'}`}></i>{:else}<strong>Adicionar vídeo</strong><small>{slot.description}</small><b><i class="ph ph-plus"></i></b>{/if}</label>{/each}</div></section>{/each}</div>
-          <div class="editor-lower"><section class="preview-panel"><div class="panel-title"><span>Prévia do módulo</span><small>{selectedSlot?.key ?? '—'}</small></div>{#if selectedSlot?.sourceUrl}<video class="video-preview" controls src={selectedSlot.sourceUrl}><track kind="captions" srclang="pt-BR" label="Português" src="data:text/vtt,WEBVTT" /></video>{:else}<div class="preview-empty"><i class="ph ph-play-circle"></i><span>Selecione um vídeo para visualizar</span></div>{/if}<div class="slot-picker">{#each slots as slot}<button class:active={selectedSlotKey === slot.key} disabled={!slot.file} on:click={() => selectedSlotKey = slot.key}>{slot.key}</button>{/each}</div></section><section class="smart-panel"><div class="panel-title"><span>Smart Cut</span><button class="smart-cut-button" class:on={smartCut} on:click={() => smartCut = !smartCut}>{smartCut ? 'Ligado' : 'Desligado'} <span></span></button></div><p>Comprime pausas longas, mantém respiro e evita cortes nervosos.</p><div class="intensity-row"><span>Intensidade</span>{#each [['natural', 'Natural'], ['dynamic', 'Dynamic'], ['aggressive', 'Aggressive']] as option}<button class:active={intensity === option[0]} on:click={() => intensity = option[0]}>{option[1]}</button>{/each}</div><button class="smart-details" on:click={() => editorTab = 'cuts'}>Ver cortes encontrados <i class="ph ph-arrow-right"></i></button></section></div>
+          <div class="role-grid">{#each ['Hooks', 'Corpos', 'CTAs'] as role, roleIndex}<section class="role-drop"><div class="role-icon"><i class={`ph ${roleIndex === 0 ? 'ph-anchor' : roleIndex === 1 ? 'ph-play-circle' : 'ph-flag'}`}></i></div><h2>{role}</h2><p>{roleIndex === 0 ? 'O começo que chama atenção' : roleIndex === 1 ? 'A parte que conta a história' : 'O final que convida a agir'}</p><label class="role-import-button"><input type="file" multiple accept="video/*,.mp4,.mov,.m4v" on:change={(event) => addFilesToRole(role, event)} /><i class="ph ph-upload-simple"></i><span>Selecionar {role === 'Hooks' ? 'até 3 vídeos' : 'vários vídeos'}</span></label><div class="role-slots">{#each slots.filter((slot) => slot.label === role) as slot}<label class:file-added={slot.file} class:slot-error={slot.status === 'error'} class="role-slot"><input type="file" accept="video/*,.mp4,.mov,.m4v" on:change={(event) => addFile(slots.indexOf(slot), event)} /><span>{slot.key}</span>{#if slot.file}<strong>{slot.file}</strong><small>{slot.status === 'analyzing' ? 'analisando...' : slot.transcript ? 'transcrito e pronto' : 'vídeo importado'}</small><i class={`ph ${slot.status === 'analyzing' ? 'ph-spinner-gap' : slot.status === 'error' ? 'ph-warning' : 'ph-check'}`}></i>{:else}<strong>Adicionar vídeo</strong><small>{slot.description}</small><b><i class="ph ph-plus"></i></b>{/if}</label>{/each}</div></section>{/each}</div>
+          <div class="editor-lower"><section class="preview-panel"><div class="panel-title"><span>Prévia do módulo</span><small>{selectedSlot?.key ?? '—'}</small></div>{#if selectedSlot?.sourceUrl}<video class="video-preview" controls preload="metadata" src={selectedSlot.sourceUrl} on:error={() => notify('A prévia não conseguiu abrir este arquivo. Tente um MP4 ou MOV salvo localmente.')}><track kind="captions" srclang="pt-BR" label="Português" src="data:text/vtt,WEBVTT" /></video>{:else}<div class="preview-empty"><i class="ph ph-play-circle"></i><span>Selecione um vídeo para visualizar</span></div>{/if}<div class="slot-picker">{#each slots as slot}<button class:active={selectedSlotKey === slot.key} disabled={!slot.file} on:click={() => selectedSlotKey = slot.key}>{slot.key}</button>{/each}</div></section><section class="smart-panel"><div class="panel-title"><span>Smart Cut</span><button class="smart-cut-button" class:on={smartCut} on:click={() => smartCut = !smartCut}>{smartCut ? 'Ligado' : 'Desligado'} <span></span></button></div><p>Comprime pausas longas, mantém respiro e evita cortes nervosos.</p><div class="intensity-row"><span>Intensidade</span>{#each [['natural', 'Natural'], ['dynamic', 'Dynamic'], ['aggressive', 'Aggressive']] as option}<button class:active={intensity === option[0]} on:click={() => intensity = option[0]}>{option[1]}</button>{/each}</div><button class="smart-details" on:click={() => editorTab = 'cuts'}>Ver cortes encontrados <i class="ph ph-arrow-right"></i></button></section></div>
         {:else if editorTab === 'cuts'}
           <section class="cuts-workspace"><div class="cut-selector"><span>Escolha um módulo</span><div>{#each slots.filter((slot) => slot.file) as slot}<button class:active={selectedSlotKey === slot.key} on:click={() => selectedSlotKey = slot.key}>{slot.key}</button>{/each}</div></div>{#if selectedSlot?.file}<div class="timeline-card"><div class="panel-title"><div><strong>{selectedSlot.key} · {selectedSlot.file}</strong><small>{selectedSlot.cuts.length} pausas longas encontradas · clique para ativar ou ignorar</small></div><button class="smart-cut-button" class:on={smartCut} on:click={() => smartCut = !smartCut}>{smartCut ? 'Smart Cut ligado' : 'Smart Cut desligado'} <span></span></button></div><div class="timeline"><div class="timeline-speech"></div>{#each selectedSlot.cuts as cut, cutIndex}<button class:disabled={!cut.enabled} class="cut-marker" style={`left:${Math.min(94, (cut.start / Math.max(selectedSlot.duration, cut.end + 1)) * 100)}%;width:${Math.max(2, ((cut.end - cut.start) / Math.max(selectedSlot.duration, cut.end + 1)) * 100)}%`} title={`${cut.start.toFixed(1)}s – ${cut.end.toFixed(1)}s`} on:click={() => toggleCut(selectedSlot.key, cutIndex)}><span>{cut.enabled ? 'comprimir' : 'manter'}</span></button>{/each}</div><div class="timeline-legend"><span><i class="speech-dot"></i>fala preservada</span><span><i class="cut-dot"></i>pausa tratada</span><span>{selectedSlot.duration ? `${selectedSlot.duration.toFixed(1)}s analisados` : 'análise leve de áudio'}</span></div></div>{:else}<div class="empty-projects"><div class="empty-icon"><i class="ph ph-waveform"></i></div><h2>Importe um módulo</h2><p>Os cortes aparecem aqui antes de renderizar.</p><button class="empty-action" on:click={() => editorTab = 'assembly'}>Voltar à montagem</button></div>{/if}</section>
         {:else}
