@@ -185,8 +185,9 @@
         { role: 'user', content: `Para cada item, gere um JSON com key, headline e duas alternativas. A headline principal deve ser um POV específico e conversável, como "POV: você encontrou algo perfeito para resolver isso". Responda somente JSON válido, sem markdown. Itens: ${JSON.stringify(items)}` }
       ] }) });
       const body = await response.json(); if (!response.ok) throw new Error(body.error?.message ?? 'A DeepSeek recusou a solicitação.');
-      const content = body.choices?.[0]?.message?.content ?? ''; const parsed = JSON.parse(content.replace(/^```json\s*/i, '').replace(/\s*```$/i, '')) as Array<{ key: string; headline: string }>;
-      for (const item of parsed) updateSlot(item.key, { headline: item.headline });
+      const content = body.choices?.[0]?.message?.content ?? ''; const decoded = JSON.parse(content.replace(/^```json\s*/i, '').replace(/\s*```$/i, '')) as Array<{ key: string; headline: string }> | { items?: Array<{ key: string; headline: string }>; results?: Array<{ key: string; headline: string }> };
+      const parsed = Array.isArray(decoded) ? decoded : decoded.items ?? decoded.results ?? [];
+      for (const item of parsed) if (item.key && item.headline) updateSlot(item.key, { headline: item.headline });
       notify('Headlines organizadas por vídeo');
     } catch (error) { notify(error instanceof Error ? error.message : 'Não foi possível gerar headlines.'); }
     finally { headlineBusy = false; }
