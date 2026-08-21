@@ -20,7 +20,35 @@ jobs:
       - run: npx cap add android
       - run: npx cap sync android
       - run: cd android && ./gradlew assembleRelease --no-daemon
+      - name: Sign and verify release APK
+        shell: bash
+        env:
+          CUTLINE_KEYSTORE_B64: ${{ secrets.CUTLINE_KEYSTORE_B64 }}
+          CUTLINE_STORE_PASSWORD: ${{ secrets.CUTLINE_STORE_PASSWORD }}
+          CUTLINE_KEY_ALIAS: ${{ secrets.CUTLINE_KEY_ALIAS }}
+          CUTLINE_KEY_PASSWORD: ${{ secrets.CUTLINE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          unsigned="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          keystore="$RUNNER_TEMP/cutline-release.keystore"
+          alias_name="${CUTLINE_KEY_ALIAS:-cutline}"
+          store_password="${CUTLINE_STORE_PASSWORD:-cutline-local-only}"
+          key_password="${CUTLINE_KEY_PASSWORD:-cutline-local-only}"
+          if [[ -n "${CUTLINE_KEYSTORE_B64:-}" ]]; then
+            echo "$CUTLINE_KEYSTORE_B64" | base64 --decode > "$keystore"
+          else
+            echo "No persistent signing secrets configured; generating a temporary installable release key."
+            keytool -genkeypair -v -keystore "$keystore" -alias "$alias_name" -keyalg RSA -keysize 2048 -validity 10000 -storepass "$store_password" -keypass "$key_password" -dname "CN=Cutline, OU=Local, O=Cutline, L=Local, ST=SP, C=BR"
+          fi
+          build_tools="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)"
+          zipalign="$build_tools/zipalign"
+          apksigner="$build_tools/apksigner"
+          aligned="$RUNNER_TEMP/cutline-release-aligned.apk"
+          signed="android/app/build/outputs/apk/release/app-release.apk"
+          "$zipalign" -f 4 "$unsigned" "$aligned"
+          "$apksigner" sign --ks "$keystore" --ks-key-alias "$alias_name" --ks-pass "pass:$store_password" --key-pass "pass:$key_password" --out "$signed" "$aligned"
+          "$apksigner" verify --verbose "$signed"
       - uses: actions/upload-artifact@v4
         with:
           name: cutline-release-apk
-          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          path: android/app/build/outputs/apk/release/app-release.apk
