@@ -1,7 +1,9 @@
 # Cutline Android
 
-O APK usa Capacitor e leva o frontend para dentro do celular. O processamento local usa `@ffmpeg/ffmpeg` + `@ffmpeg/core` (FFmpeg compilado para WebAssembly), então não depende do servidor, Python, C++ ou internet durante a edição.
+O APK usa Capacitor e leva o frontend para dentro do celular. O processamento local usa `@ffmpeg/ffmpeg` + `@ffmpeg/core` (FFmpeg compilado para WebAssembly). Smart Cut e concatenação rodam no aparelho; o servidor LAN é usado como fallback no desktop.
 
-O core FFmpeg fica no bundle do app; os vídeos continuam em disco e o processamento é feito em streaming sempre que a operação permitir. O workflow `.github/workflows/android.yml` gera um APK debug no GitHub Actions com Node 22, Java 17 e Android SDK.
+O core FFmpeg fica no bundle do app. O Whisper.cpp fica em um chunk separado e o modelo quantizado é baixado uma vez, com cache local, somente quando a transcrição é ativada e o WebView oferece memória compartilhada. Em aparelhos com 8 GB ou mais e CPU adequada, o perfil sugere `small-q5_1`; nos demais, `tiny-q5_1`.
 
-Permissões serão solicitadas somente no primeiro uso de importar/exportar: leitura de vídeos e gravação do resultado. O app deve explicar cada permissão antes do prompt nativo e registrar uma auditoria local com data, ação, arquivo e resultado — sem enviar mídia para fora do aparelho.
+O workflow `.github/workflows/android.yml` gera um APK `release` sem assinatura no GitHub Actions com Node 22, Java 21 e Android SDK. Para distribuição instalada em vários aparelhos, configure uma keystore persistente nos secrets do GitHub.
+
+O app não envia vídeo para a DeepSeek. A chave fica no armazenamento local e o usuário precisa autorizar explicitamente o envio das transcrições para gerar headlines. A auditoria da sessão mostra importação, análise, render e consentimento. A transcrição local pode ser bloqueada por WebViews sem `crossOriginIsolated`; nesse caso o app informa o motivo em Configurações, sem fingir que o Whisper está ativo.
